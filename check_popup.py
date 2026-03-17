@@ -5,7 +5,7 @@ from playwright.sync_api import sync_playwright
 
 print("连接Chrome...")
 with sync_playwright() as p:
-    browser = p.chromium.connect_over_cdp("http://localhost:9222")
+    browser = p.chromium.connect_over_cdp("http://localhost:9223")
     contexts = browser.contexts
     if not contexts:
         print("错误: 没有找到浏览器上下文")

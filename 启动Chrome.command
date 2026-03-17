@@ -8,7 +8,7 @@ echo "正在启动..."
 echo ""
 
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --remote-debugging-port=9222 \
+  --remote-debugging-port=9223 \
   --user-data-dir="$HOME/chrome-debug-profile" \
   "https://www.zhipin.com/web/user/?ka=header-login" &
 

@@ -80,9 +80,9 @@ def main():
     
     from playwright.sync_api import sync_playwright
     
-    print("正在连接 localhost:9222 ...")
+    print("正在连接 localhost:9223 ...")
     p = sync_playwright().start()
-    browser = p.chromium.connect_over_cdp("http://localhost:9222")
+    browser = p.chromium.connect_over_cdp("http://localhost:9223")
     contexts = browser.contexts
     
     if not contexts:

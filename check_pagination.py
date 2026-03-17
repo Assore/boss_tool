@@ -5,7 +5,7 @@ from playwright.sync_api import sync_playwright
 
 print("连接Chrome...")
 with sync_playwright() as p:
-    browser = p.chromium.connect_over_cdp("http://localhost:9222")
+    browser = p.chromium.connect_over_cdp("http://localhost:9223")
     contexts = browser.contexts
     page = contexts[0].pages[0] if contexts[0].pages else contexts[0].new_page()
     

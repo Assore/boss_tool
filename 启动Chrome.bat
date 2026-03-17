@@ -6,7 +6,7 @@ echo.
 echo 正在启动...
 echo.
 
-start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="%USERPROFILE%\chrome-debug-profile" "https://www.zhipin.com/web/user/?ka=header-login"
+start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9223 --user-data-dir="%USERPROFILE%\chrome-debug-profile" "https://www.zhipin.com/web/user/?ka=header-login"
 
 echo.
 echo Chrome已启动！

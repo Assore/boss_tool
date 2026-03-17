@@ -7,6 +7,8 @@ import re
 import sys
 import requests
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 RESUME_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resumes")
 JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs.json")
@@ -44,7 +46,8 @@ DEFAULT_CONFIG = {
     'model': 'glm-4.7',
     'threshold': 50,
     'use_custom_prompt': False,
-    'custom_prompt': ''
+    'custom_prompt': '',
+    'concurrency': 5
 }
 
 def load_ui_config():
@@ -447,7 +450,7 @@ def connect_chrome():
     global page_instance, playwright_instance
     
     playwright_instance = sync_playwright().start()
-    browser = playwright_instance.chromium.connect_over_cdp("http://localhost:9222")
+    browser = playwright_instance.chromium.connect_over_cdp("http://localhost:9223")
     
     contexts = browser.contexts
     if len(contexts) > 0:
@@ -495,6 +498,249 @@ def click_confirm(page):
             }
         }
     }''')
+
+# ==================== 并发处理相关函数 ====================
+
+def find_next_session(page, processed, selected_jobs, log, start_index=0):
+    """
+    找到下一个未处理的会话
+    返回: (found, index, name, job_name) 或 (False, None, None, None)
+    """
+    items = page.locator('.geek-item-wrap')
+    total_items = items.count()
+    
+    time_keywords = ['昨天', '前天', '刚刚', '今天', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日']
+    
+    def is_time(text):
+        if re.match(r'\d{1,2}:\d{2}', text):
+            return True
+        if text in time_keywords:
+            return True
+        if re.match(r'^周[一二三四五六日]$', text):
+            return True
+        if re.match(r'\d{1,2}-\d{1,2}', text):
+            return True
+        if re.match(r'\d{1,2}月\d{1,2}日', text):
+            return True
+        return False
+    
+    i = start_index
+    while i < total_items:
+        text = items.nth(i).inner_text()
+        lines = text.split('\n')
+        
+        start_idx = 0
+        if lines and re.match(r'^\d+$', lines[0]):
+            start_idx = 1
+        
+        if start_idx < len(lines) and is_time(lines[start_idx]):
+            name = lines[start_idx + 1] if start_idx + 1 < len(lines) else ""
+            job_name = lines[start_idx + 2] if start_idx + 2 < len(lines) else ""
+        else:
+            name = lines[start_idx] if start_idx < len(lines) else ""
+            job_name = lines[start_idx + 1] if start_idx + 1 < len(lines) else ""
+        
+        if is_time(job_name):
+            job_name = ""
+        
+        # 岗位筛选
+        if selected_jobs and job_name:
+            job_matched = False
+            for selected in selected_jobs:
+                selected_keywords = selected.replace("实习生", "").replace("工程师", "").replace("开发", "").replace("算法", "")
+                job_keywords = job_name.replace("实习生", "").replace("工程师", "").replace("开发", "").replace("算法", "")
+                if (selected_keywords and job_keywords and 
+                    (selected_keywords in job_keywords or job_keywords in selected_keywords)):
+                    job_matched = True
+                    break
+                if selected in job_name or job_name in selected:
+                    job_matched = True
+                    break
+            if not job_matched:
+                i += 1
+                continue
+        elif selected_jobs and not job_name:
+            i += 1
+            continue
+        
+        if name not in processed:
+            return True, i, name, job_name
+        
+        i += 1
+    
+    return False, None, None, None
+
+def collect_session_info(page, index, log):
+    """
+    点击会话并读取简历
+    返回: (name, job_name, resume_text) 或 (None, None, None) 如果失败
+    """
+    items = page.locator('.geek-item-wrap')
+    
+    # 关闭可能存在的弹窗
+    try:
+        dialog = page.locator('.dialog-wrap.active, [class*="dialog"][class*="active"]').first
+        if dialog.count() > 0:
+            page.keyboard.press('Escape')
+            time.sleep(0.5)
+    except:
+        pass
+    
+    # 获取会话信息
+    text = items.nth(index).inner_text()
+    lines = text.split('\n')
+    
+    time_keywords = ['昨天', '前天', '刚刚', '今天', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日']
+    
+    def is_time(t):
+        if re.match(r'\d{1,2}:\d{2}', t):
+            return True
+        if t in time_keywords:
+            return True
+        if re.match(r'^周[一二三四五六日]$', t):
+            return True
+        if re.match(r'\d{1,2}-\d{1,2}', t):
+            return True
+        if re.match(r'\d{1,2}月\d{1,2}日', t):
+            return True
+        return False
+    
+    start_idx = 0
+    if lines and re.match(r'^\d+$', lines[0]):
+        start_idx = 1
+    
+    if start_idx < len(lines) and is_time(lines[start_idx]):
+        name = lines[start_idx + 1] if start_idx + 1 < len(lines) else ""
+        job_name = lines[start_idx + 2] if start_idx + 2 < len(lines) else ""
+    else:
+        name = lines[start_idx] if start_idx < len(lines) else ""
+        job_name = lines[start_idx + 1] if start_idx + 1 < len(lines) else ""
+    
+    if is_time(job_name):
+        job_name = ""
+    
+    # 点击会话
+    try:
+        items.nth(index).click(force=True)
+    except:
+        items.nth(index).evaluate('el => el.click()')
+    time.sleep(2)
+    
+    # 读取简历
+    resume_text = None
+    if name:
+        resume_text = capture_resume_ocr(page, name, log)
+    
+    return name, job_name, resume_text
+
+def send_message_to_session(page, message, log):
+    """
+    发送消息和简历请求
+    """
+    input_area = page.locator('[contenteditable="true"]').first
+    input_area.click()
+    time.sleep(1)
+    input_area.fill(message)
+    time.sleep(1)
+    
+    page.locator('div.submit:has-text("发送")').first.click()
+    log(f"  ✅ 消息已发送")
+    time.sleep(2)
+    
+    page.locator('text=求简历').first.click()
+    time.sleep(1)
+    
+    click_confirm(page)
+    log(f"  ✅ 简历请求已发送")
+    time.sleep(1)
+
+def match_single_resume_for_batch(args):
+    """
+    用于并发调用的单个简历匹配函数
+    args: (resume_text, job, api_url, api_key, model, custom_prompt, name, log_lock)
+    """
+    resume_text, job, api_url, api_key, model, custom_prompt, name, log_lock = args
+    
+    result = {
+        'name': name,
+        'job_name': job['name'] if job else '',
+        'score': 0,
+        'details': {},
+        'error': None
+    }
+    
+    if not job:
+        result['error'] = '未找到岗位描述'
+        return result
+    
+    try:
+        # 不使用流式输出，直接获取结果
+        match_result = match_resume_llm(
+            resume_text, job['name'], job['description'],
+            api_url, api_key, model, custom_prompt,
+            stream_callback=None
+        )
+        result['score'] = match_result.get('score', 0)
+        result['details'] = match_result
+    except Exception as e:
+        result['error'] = str(e)[:50]
+    
+    return result
+
+def batch_match_resumes(resume_data_list, api_url, api_key, model, custom_prompt, log, max_workers=5):
+    """
+    并发匹配多个简历
+    resume_data_list: [(name, job_name, resume_text), ...]
+    返回: {name: match_result, ...}
+    """
+    jobs = load_jobs()
+    
+    # 准备并发任务参数
+    task_args = []
+    for name, job_name, resume_text in resume_data_list:
+        if not resume_text:
+            continue
+        job = find_job_by_name(jobs, job_name) if job_name else None
+        task_args.append((resume_text, job, api_url, api_key, model, custom_prompt, name, None))
+    
+    if not task_args:
+        return {}
+    
+    log(f"🚀 开始并发匹配 {len(task_args)} 份简历...")
+    
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_name = {
+            executor.submit(match_single_resume_for_batch, args): args[6]  # args[6] is name
+            for args in task_args
+        }
+        
+        # 收集结果
+        completed = 0
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                result = future.result()
+                results[name] = result
+                completed += 1
+                
+                # 输出详细匹配结果
+                details = result.get('details', {})
+                log(f"  [{completed}/{len(task_args)}] {name}: {result['score']}分")
+                if details:
+                    log(f"      技能: {details.get('match_skills', '-')}")
+                    log(f"      经验: {details.get('match_exp', '-')}")
+                    log(f"      学历: {details.get('match_edu', '-')}")
+                    log(f"      优势: {details.get('pros', '-')}")
+                    log(f"      不足: {details.get('cons', '-')}")
+                    log(f"      建议: {details.get('recommend', '-')}")
+            except Exception as e:
+                results[name] = {'name': name, 'score': 0, 'error': str(e)[:50]}
+                completed += 1
+                log(f"  [{completed}/{len(task_args)}] {name}: 匹配失败 - {str(e)[:30]}")
+    
+    return results
 
 def process_one_session(page, message, processed, log, config, start_index=0):
     items = page.locator('.geek-item-wrap')
@@ -704,6 +950,12 @@ def process_one_session(page, message, processed, log, config, start_index=0):
     return False, None, None, None, total_items  # 返回总数量表示已遍历完
 
 def run_automation(config, progress_callback=None):
+    """
+    新的批量处理流程：
+    1. 串行收集简历（点击会话 → OCR读取）
+    2. 并发LLM匹配
+    3. 串行发送消息（根据匹配结果）
+    """
     global page_instance
     
     results = []
@@ -723,6 +975,7 @@ def run_automation(config, progress_callback=None):
             log("📝 将读取在线简历内容")
         if config.get('enable_match', False):
             log(f"🎯 匹配度阈值: {config.get('threshold', 50)}分")
+            log(f"⚡ 并发LLM匹配已启用")
         selected_jobs = config.get('selected_jobs', [])
         if selected_jobs:
             log(f"🔍 岗位筛选: {len(selected_jobs)} 个岗位")
@@ -735,98 +988,191 @@ def run_automation(config, progress_callback=None):
         success_count = 0
         skip_count = 0
         session_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
-        current_index = 0  # 追踪当前遍历位置
-        last_scroll_top = -1  # 用于检测是否滚动到底部
-        no_new_sessions_count = 0  # 连续没有新会话的次数
+        current_index = 0
+        no_new_sessions_count = 0
+        
+        # 批量收集大小（一次收集多少份简历后再并发LLM）
+        concurrency = config.get('concurrency', 5)
+        batch_size = min(config.get('count', 3), concurrency)  # 最多一次处理 concurrency 个
         
         while success_count + skip_count < config.get('count', 3):
-            success, name, resume_text, match_result, next_index = process_one_session(
-                page, config.get('message', ''), processed, log, config, current_index
-            )
-            current_index = next_index
+            # ============ 阶段1：批量收集简历 ============
+            log(f"📦 开始收集简历（目标: {batch_size} 份）...")
             
-            if success:
-                skipped = match_result and match_result.get('score', 0) < config.get('threshold', 50)
-                if skipped:
-                    skip_count += 1
-                else:
-                    success_count += 1
+            collected_data = []  # [(name, job_name, resume_text, session_index), ...]
+            collect_count = 0
+            
+            while collect_count < batch_size:
+                found, index, name, job_name = find_next_session(
+                    page, processed, selected_jobs, log, current_index
+                )
                 
-                # 保存日志记录
+                if found:
+                    log(f"  [{collect_count + 1}] 收集: {name} (应聘: {job_name if job_name else '未知'})")
+                    
+                    # 点击会话并读取简历
+                    actual_name, actual_job_name, resume_text = collect_session_info(page, index, log)
+                    
+                    if actual_name:
+                        collected_data.append((actual_name, actual_job_name, resume_text, index))
+                        processed.append(actual_name)
+                        save_processed_list(processed)  # 立即保存
+                        collect_count += 1
+                    
+                    # 滚动让新会话进入视野
+                    page.evaluate('''() => {
+                        const userList = document.querySelector('.user-list');
+                        if (userList) {
+                            userList.scrollTop += 200;
+                        }
+                    }''')
+                    time.sleep(0.3)
+                    
+                    current_index = 0  # 重置索引，重新遍历
+                else:
+                    # 当前可见区域没有新会话，尝试滚动
+                    log("📥 当前区域已遍历完毕，尝试加载更多会话...")
+                    
+                    scroll_info = page.evaluate('''() => {
+                        const userList = document.querySelector('.user-list');
+                        if (userList) {
+                            return {
+                                scrollTop: userList.scrollTop,
+                                scrollHeight: userList.scrollHeight,
+                                clientHeight: userList.clientHeight
+                            };
+                        }
+                        return null;
+                    }''')
+                    
+                    if scroll_info:
+                        current_scroll_top = scroll_info['scrollTop']
+                        max_scroll = scroll_info['scrollHeight'] - scroll_info['clientHeight']
+                        
+                        log(f"   滚动位置: {current_scroll_top}/{max_scroll}")
+                        
+                        if current_scroll_top >= max_scroll - 10:
+                            no_new_sessions_count += 1
+                            log(f"   已到达列表底部")
+                            
+                            if no_new_sessions_count >= 2:
+                                log("✅ 全部会话已处理完毕！")
+                                break
+                        else:
+                            page.evaluate('''() => {
+                                const userList = document.querySelector('.user-list');
+                                if (userList) {
+                                    userList.scrollTop += 500;
+                                }
+                            }''')
+                            time.sleep(1)
+                            current_index = 0
+                            no_new_sessions_count = 0
+                    else:
+                        log("⚠️ 无法获取滚动信息，停止处理")
+                        break
+            
+            if not collected_data:
+                log("没有收集到新会话，结束处理")
+                break
+            
+            # ============ 阶段2：并发LLM匹配 ============
+            match_results = {}
+            if config.get('enable_match', False) and config.get('read_resume', True):
+                match_results = batch_match_resumes(
+                    [(name, job_name, resume) for name, job_name, resume, _ in collected_data],
+                    config.get('api_url', ''),
+                    config.get('api_key', ''),
+                    config.get('model', 'glm-4.7'),
+                    config.get('custom_prompt'),
+                    log,
+                    max_workers=concurrency
+                )
+            else:
+                # 不启用匹配，默认全部通过
+                for name, job_name, resume_text, _ in collected_data:
+                    match_results[name] = {'name': name, 'job_name': job_name, 'score': 100, 'details': {}}
+            
+            # ============ 阶段3：串行发送消息 ============
+            log("📤 开始发送消息...")
+            
+            for name, job_name, resume_text, session_index in collected_data:
+                match_result = match_results.get(name, {'name': name, 'score': 0, 'error': '未知错误'})
+                score = match_result.get('score', 0)
+                
+                if config.get('enable_match', False) and score < config.get('threshold', 50):
+                    log(f"  ⏭️ {name}: 匹配度 {score}分 < 阈值，跳过发送")
+                    skip_count += 1
+                    
+                    # 保存日志
+                    log_entry = {
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'session_time': session_start_time,
+                        'name': name,
+                        'job_name': match_result.get('job_name', job_name),
+                        'score': score,
+                        'skipped': True,
+                        'message_sent': False,
+                        'details': match_result.get('details', {})
+                    }
+                    save_log(log_entry)
+                    continue
+                
+                # 发送消息
+                log(f"  📨 {name}: 发送消息...")
+                
+                # 重新点击会话（因为之前可能关闭了或滚动位置变了）
+                items = page.locator('.geek-item-wrap')
+                found, new_index, _, _ = find_next_session(page, [n for n in processed if n != name], selected_jobs, log, 0)
+                
+                if found:
+                    try:
+                        items.nth(new_index).click(force=True)
+                    except:
+                        items.nth(new_index).evaluate('el => el.click()')
+                    time.sleep(2)
+                
+                send_message_to_session(page, config.get('message', ''), log)
+                success_count += 1
+                
+                # 保存日志
                 log_entry = {
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'session_time': session_start_time,
                     'name': name,
-                    'job_name': match_result.get('job_name', '') if match_result else '',
-                    'score': match_result.get('score', 0) if match_result else 0,
-                    'skipped': skipped,
-                    'message_sent': not skipped,
-                    'details': match_result.get('details', {}) if match_result else {}
+                    'job_name': match_result.get('job_name', job_name),
+                    'score': score,
+                    'skipped': False,
+                    'message_sent': True,
+                    'details': match_result.get('details', {})
                 }
                 save_log(log_entry)
                 
-                # 重置滚动检测
-                last_scroll_top = -1
-                no_new_sessions_count = 0
-                
                 time.sleep(2)
-            else:
-                # 遍历完成当前可见区域，尝试滚动加载更多会话
-                log("📥 当前区域已遍历完毕，尝试加载更多会话...")
                 
-                # 获取当前滚动位置
-                scroll_info = page.evaluate('''() => {
+                # 滚动
+                page.evaluate('''() => {
                     const userList = document.querySelector('.user-list');
                     if (userList) {
-                        return {
-                            scrollTop: userList.scrollTop,
-                            scrollHeight: userList.scrollHeight,
-                            clientHeight: userList.clientHeight
-                        };
+                        userList.scrollTop += 200;
                     }
-                    return null;
                 }''')
-                
-                if scroll_info:
-                    current_scroll_top = scroll_info['scrollTop']
-                    max_scroll = scroll_info['scrollHeight'] - scroll_info['clientHeight']
-                    
-                    log(f"   滚动位置: {current_scroll_top}/{max_scroll}")
-                    
-                    # 检查是否已滚动到底部
-                    if current_scroll_top >= max_scroll - 10:
-                        no_new_sessions_count += 1
-                        log(f"   已到达列表底部")
-                        
-                        if no_new_sessions_count >= 2:
-                            log("✅ 全部会话已处理完毕！")
-                            break
-                    else:
-                        # 向下滚动加载更多
-                        page.evaluate('''() => {
-                            const userList = document.querySelector('.user-list');
-                            if (userList) {
-                                userList.scrollTop += 500;  // 滚动更多
-                            }
-                        }''')
-                        time.sleep(1)  # 等待新内容加载
-                        
-                        # 检查是否有新会话出现
-                        new_items_count = page.locator('.geek-item-wrap').count()
-                        log(f"   滚动后可见会话: {new_items_count} 个")
-                        
-                        # 重置遍历位置，从新加载的内容开始
-                        current_index = 0
-                        no_new_sessions_count = 0
-                else:
-                    log("⚠️ 无法获取滚动信息，停止处理")
-                    break
+                time.sleep(0.3)
+            
+            # 保存处理列表
+            save_processed_list(processed)
+            
+            # 检查是否达到目标
+            if success_count + skip_count >= config.get('count', 3):
+                break
         
         log("-" * 40)
         log(f"本次发送消息: {success_count} 个, 跳过(匹配度不足): {skip_count} 个")
         
     except Exception as e:
         log(f"错误: {e}")
+        import traceback
+        log(traceback.format_exc())
     
     return results
 
@@ -842,7 +1188,7 @@ with tab1:
     
     # 步骤1：启动Chrome
     st.markdown("**第一步：启动Chrome浏览器**")
-    col_chrome, col_status = st.columns([1, 3])
+    col_chrome, col_restart, col_status = st.columns([1, 1, 2])
     with col_chrome:
         if st.button("🌐 启动Chrome", type="primary", use_container_width=True):
             import subprocess
@@ -855,13 +1201,18 @@ with tab1:
             try:
                 subprocess.Popen([
                     chrome_path,
-                    "--remote-debugging-port=9222",
+                    "--remote-debugging-port=9223",
                     "--user-data-dir=" + os.path.expanduser("~/chrome-debug-profile"),
                     "https://www.zhipin.com/web/user/?ka=header-login"
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 st.success("✅ Chrome已启动！请在浏览器中登录BOSS直聘")
             except Exception as e:
                 st.error(f"启动失败: {e}")
+    
+    with col_restart:
+        if st.button("🔄 完全重启", type="secondary", use_container_width=True):
+            st.warning("正在重启应用...")
+            st.rerun()
     
     with col_status:
         st.info("💡 启动后请在浏览器中扫码登录BOSS直聘，登录完成后，进入**新招呼**界面，继续下一步")
@@ -921,6 +1272,8 @@ with tab1:
         
         threshold = st.slider("匹配度阈值", min_value=0, max_value=100, value=saved_config.get('threshold', 50), help="低于此分数的应聘者将被跳过", key="threshold_slider")
         
+        concurrency = st.slider("并发数", min_value=1, max_value=10, value=saved_config.get('concurrency', 5), help="同时处理简历的数量，越大速度越快但API压力越大", key="concurrency_slider")
+        
         st.divider()
         st.subheader("📝 自定义匹配Prompt")
         use_custom_prompt = st.checkbox("使用自定义Prompt", value=saved_config.get('use_custom_prompt', False), key="use_custom_prompt_cb")
@@ -956,7 +1309,8 @@ with tab1:
         'model': model,
         'threshold': threshold,
         'use_custom_prompt': use_custom_prompt,
-        'custom_prompt': custom_prompt if custom_prompt else ''
+        'custom_prompt': custom_prompt if custom_prompt else '',
+        'concurrency': concurrency
     }
     
     if current_config != saved_config:
@@ -973,7 +1327,8 @@ with tab1:
         'model': model,
         'threshold': threshold,
         'selected_jobs': selected_jobs,
-        'custom_prompt': custom_prompt
+        'custom_prompt': custom_prompt,
+        'concurrency': concurrency
     }
     
     col_btn1, col_btn2 = st.columns(2)
