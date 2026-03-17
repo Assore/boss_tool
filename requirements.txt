@@ -1,0 +1,6 @@
+playwright
+streamlit
+Pillow
+requests
+pytesseract
+pyobjc-framework-Vision; sys_platform == 'darwin'
