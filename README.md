@@ -23,11 +23,24 @@ playwright install chromium
 
 浏览器会自动打开一个网页界面，在那里操作即可。
 
+## 配置 API
+
+如需使用 LLM 智能匹配功能，请编辑 `api_config.json` 文件：
+
+```json
+{
+  "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+  "api_key": "你的API密钥"
+}
+```
+
 ## 功能
 
 - 自动点击未读消息
 - 自动发送自定义消息
 - 自动发送简历
+- LLM智能匹配简历与岗位
+- 岗位筛选功能
 
 ## 注意事项
 

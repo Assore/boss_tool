@@ -21,6 +21,8 @@ processed.json
 match_results.json
 current_resume.json
 geek_info.json
+ui_config.json
+api_config.json
 
 # 截图和简历
 *.png
